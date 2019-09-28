@@ -1,0 +1,278 @@
+diff -u xv6/defs.h xv6new/defs.h
+--- xv6/defs.h	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/defs.h	2019-09-07 23:21:40.000000000 +0530
+@@ -116,6 +116,8 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++void            setprio(int n);
++int             getprio(void);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+Common subdirectories: xv6/.git and xv6new/.git
+diff -u xv6/Makefile xv6new/Makefile
+--- xv6/Makefile	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/Makefile	2019-09-14 23:29:15.000000000 +0530
+@@ -173,6 +173,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -242,7 +243,7 @@
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
++	printf.c umalloc.c test.c \
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+Only in xv6new: .Makefile.swp
+diff -u xv6/proc.c xv6new/proc.c
+--- xv6/proc.c	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/proc.c	2019-09-15 00:16:19.000000000 +0530
+@@ -49,7 +49,8 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+-
++  p->pending = 0;     //default pending cycles
++  p->priority = 1;    //default priority
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -102,7 +103,6 @@
+ 
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+-
+   // this assignment to p->state lets other cores
+   // run this process. the acquire forces the above
+   // writes to be visible, and the lock is also needed
+@@ -169,6 +169,13 @@
+ 
+   safestrcpy(np->name, proc->name, sizeof(proc->name));
+ 
++  /*
++  Child gets priority of parent process
++  Child pending cycles is by default 0
++  */
++   np->priority = proc->priority;
++  np->pending = 0;
++
+   pid = np->pid;
+ 
+   acquire(&ptable.lock);
+@@ -280,6 +287,8 @@
+ scheduler(void)
+ {
+   struct proc *p;
++  int foundRunnable = 0;
++ 
+ 
+   for(;;){
+     // Enable interrupts on this processor.
+@@ -287,19 +296,42 @@
+ 
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++    foundRunnable = 0;
++
++    /*
++    Checks for atleast one process in RUNNABLE state
++    and update as foundRunnable = 1 if found any
++    */
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->state == RUNNABLE) {
++        foundRunnable = 1;
++        break;
++      }
++    }
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++       if((p->state == SLEEPING || p->state == RUNNING || p->state == RUNNABLE) && (foundRunnable == 1)) {
++        p->pending += p->priority;
++      }
++
+       if(p->state != RUNNABLE)
+         continue;
+ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
++      // cprintf("PID:%d  priority:%d  pending:%d \n");
+       proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
+-      swtch(&cpu->scheduler, p->context);
++
++      // Context switch from scheduler to process in Round Robin Fashion
++      swtch(&cpu->scheduler, p->context); 
+       switchkvm();
+ 
++      // Update pending cycles if process sleeping and not yielding
++      if(proc->pending > 0 && proc->state == SLEEPING ) {
++        proc->pending--;
++      }
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       proc = 0;
+@@ -339,8 +371,17 @@
+ yield(void)
+ {
+   acquire(&ptable.lock);  //DOC: yieldlock
+-  proc->state = RUNNABLE;
+-  sched();
++  
++  proc->pending--;
++  /* 
++  Context switch to scheduler occurs if pending 
++  slices allocated to a process becomes 0 OR 
++  process spends a large time in CPU
++  */
++  if(proc->pending % 70 == 0 || proc->pending == 0) {
++    proc->state = RUNNABLE;
++    sched();
++  }
+   release(&ptable.lock);
+ }
+ 
+@@ -482,4 +523,30 @@
+     }
+     cprintf("\n");
+   }
++
+ }
++
++// *************************************
++
++// _SET_PRIORITY_SYSCALL
++void
++setprio(int n)
++{
++  acquire(&ptable.lock);
++  proc->priority = n;
++  release(&ptable.lock);
++}
++
++
++// _GET_PRIORITY_SYSCALL
++int
++getprio(void)
++{
++  int n;
++  acquire(&ptable.lock);
++  n = proc->priority;
++  release(&ptable.lock);
++  return n;
++  }
++
++// *************************************
+diff -u xv6/proc.h xv6new/proc.h
+--- xv6/proc.h	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/proc.h	2019-09-14 23:27:46.000000000 +0530
+@@ -63,6 +63,8 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int priority;                    // Process priority val
++  int pending;                 // Process parts left to be run
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+Only in xv6new: run.sh
+diff -u xv6/syscall.c xv6new/syscall.c
+--- xv6/syscall.c	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/syscall.c	2019-09-15 12:33:49.419912415 +0530
+@@ -98,6 +98,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_setprio(void);
++extern int sys_getprio(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -121,6 +123,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_setprio] sys_setprio,
++[SYS_getprio] sys_getprio,
+ };
+ 
+ void
+@@ -136,4 +140,4 @@
+             proc->pid, proc->name, num);
+     proc->tf->eax = -1;
+   }
+-}
++}
+\ No newline at end of file
+diff -u xv6/syscall.h xv6new/syscall.h
+--- xv6/syscall.h	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/syscall.h	2019-09-14 23:27:41.000000000 +0530
+@@ -1,3 +1,4 @@
++
+ // System call numbers
+ #define SYS_fork    1
+ #define SYS_exit    2
+@@ -20,3 +21,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_setprio  22
++#define SYS_getprio  23
+diff -u xv6/sysproc.c xv6new/sysproc.c
+--- xv6/sysproc.c	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/sysproc.c	2019-09-15 12:44:24.527893882 +0530
+@@ -89,3 +89,23 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++// Set priority of process 
++int 
++sys_setprio(void){
++  int priority;
++  if( argint(0, &priority) < 0 )
++    return -1;
++  
++  if( priority < 1 )
++      return -1;
++    
++    setprio(priority);
++    return 0;
++}
++
++// Get priority of process
++int 
++sys_getprio(void){
++  return getprio();
++}
+Only in xv6new: test.c
+diff -u xv6/user.h xv6new/user.h
+--- xv6/user.h	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/user.h	2019-09-14 23:27:40.000000000 +0530
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void setprio(int);
++int  getprio(void);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+diff -u xv6/usys.S xv6new/usys.S
+--- xv6/usys.S	2018-11-16 17:28:09.000000000 +0530
++++ xv6new/usys.S	2019-09-14 23:27:38.000000000 +0530
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(setprio)
++SYSCALL(getprio)
+\ No newline at end of file
